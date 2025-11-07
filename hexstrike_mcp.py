@@ -21,6 +21,7 @@ import sys
 import os
 import argparse
 import logging
+import json
 from typing import Dict, Any, Optional
 import requests
 import time
@@ -147,17 +148,71 @@ MAX_RETRIES = 3  # Maximum number of retries for connection attempts
 class HexStrikeClient:
     """Enhanced client for communicating with the HexStrike AI API Server"""
 
-    def __init__(self, server_url: str, timeout: int = DEFAULT_REQUEST_TIMEOUT):
+    def __init__(
+        self,
+        server_url: str,
+        timeout: int = DEFAULT_REQUEST_TIMEOUT,
+        compact_output: bool = False,
+        max_compact_length: int = 600,
+        max_compact_items: int = 5,
+    ):
         """
         Initialize the HexStrike AI Client
 
         Args:
             server_url: URL of the HexStrike AI API Server
             timeout: Request timeout in seconds
+            compact_output: Whether to aggressively trim noisy fields in responses
+            max_compact_length: Maximum number of characters to keep per text field when compact mode is enabled
+            max_compact_items: Maximum number of list/dict entries to retain when compact mode is enabled
         """
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        self.compact_output = compact_output
+        self.max_compact_length = max(120, max_compact_length or 600)
+        self.max_compact_items = max(1, max_compact_items or 5)
+        self.max_compact_depth = 3
+        self._compact_priority_fields = [
+            "critical_findings",
+            "high_risk_findings",
+            "key_findings",
+            "highlights",
+            "priority_findings",
+            "executive_summary",
+            "notable_findings",
+            "business_impact",
+            "recommended_actions",
+            "remediation_steps",
+            "next_steps",
+            "attack_paths",
+            "exploitation_scenarios",
+            "evidence",
+        ]
+        self._compact_fallback_lists = [
+            "vulnerabilities",
+            "issues",
+            "findings",
+            "alerts",
+            "detections",
+            "weaknesses",
+            "anomalies",
+        ]
+        self._noisy_fields = {
+            "raw_output",
+            "raw_logs",
+            "logs",
+            "stdout",
+            "stderr",
+            "console_output",
+            "full_output",
+            "detailed_report",
+            "raw_response",
+            "tool_log",
+            "transcript",
+            "debug_log",
+            "extended_output",
+        }
 
         # Try to connect to server with retries
         connected = False
@@ -189,6 +244,187 @@ class HexStrikeClient:
             logger.error(error_msg)
             # We'll continue anyway to allow the MCP server to start, but tools will likely fail
 
+    def _optimize_response(self, response_data: Any) -> Any:
+        """Attach compact views and optionally trim noisy sections to reduce token usage."""
+        if not isinstance(response_data, dict):
+            return response_data
+
+        # Skip optimization for plain error payloads
+        if (
+            response_data.get("success") is False
+            and "error" in response_data
+            and len(response_data.keys()) <= 3
+        ):
+            return response_data
+
+        compact_view = self._build_compact_view(response_data)
+        if compact_view:
+            response_data["_compact_view"] = compact_view
+            response_data["_compact_text"] = self._format_compact_text(compact_view)
+
+        if self.compact_output:
+            self._truncate_noisy_sections(response_data)
+
+        return response_data
+
+    def _build_compact_view(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract the most relevant sections from a payload for quick consumption."""
+        if not isinstance(payload, dict):
+            return {}
+
+        candidate = payload.get("result")
+        if isinstance(candidate, dict):
+            target = candidate
+        else:
+            target = payload
+
+        compact: Dict[str, Any] = {}
+
+        summary_block = target.get("summary")
+        if isinstance(summary_block, dict):
+            summary_view: Dict[str, Any] = {}
+            for key in (
+                "highlights",
+                "key_findings",
+                "critical_findings",
+                "recommended_actions",
+                "next_steps",
+                "executive_summary",
+            ):
+                if summary_block.get(key):
+                    summary_view[key] = self._prepare_compact_value(summary_block[key])
+            if not summary_view and summary_block:
+                summary_view = self._prepare_compact_value(summary_block)
+            if summary_view:
+                compact["summary"] = summary_view
+        elif summary_block:
+            compact["summary"] = self._prepare_compact_value(summary_block)
+
+        for field in self._compact_priority_fields:
+            if field in target and target[field]:
+                compact[field] = self._prepare_compact_value(target[field])
+
+        for list_field in self._compact_fallback_lists:
+            if list_field in target and target[list_field]:
+                compact[list_field] = self._prepare_compact_value(target[list_field])
+                break
+
+        metrics: Dict[str, Any] = {}
+        for metric in (
+            "risk_score",
+            "severity",
+            "confidence",
+            "score",
+            "impact",
+            "likelihood",
+            "success_rate",
+            "coverage",
+        ):
+            if metric in target and target[metric] not in (None, ""):
+                metrics[metric] = target[metric]
+        if metrics:
+            compact["metrics"] = metrics
+
+        metadata: Dict[str, Any] = {}
+        for meta_key in (
+            "target",
+            "targets",
+            "scope",
+            "asset",
+            "service",
+            "tool",
+            "tool_name",
+            "scan_id",
+            "workflow_id",
+            "task_id",
+        ):
+            if meta_key in target and target[meta_key]:
+                metadata[meta_key] = target[meta_key]
+        if metadata:
+            compact["metadata"] = metadata
+
+        if not compact:
+            return {}
+
+        compact["generated_at"] = datetime.utcnow().isoformat() + "Z"
+        return compact
+
+    def _prepare_compact_value(self, value: Any, depth: int = 0) -> Any:
+        """Normalize complex values into a trimmed, token-friendly representation."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return self._truncate_text(value)
+        if depth >= self.max_compact_depth:
+            if isinstance(value, (dict, list)):
+                return "..."
+            return value
+        if isinstance(value, list):
+            items = [
+                self._prepare_compact_value(item, depth + 1)
+                for item in value[: self.max_compact_items]
+            ]
+            if len(value) > self.max_compact_items:
+                items.append(f"... (+{len(value) - self.max_compact_items} more)")
+            return items
+        if isinstance(value, dict):
+            trimmed: Dict[str, Any] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= self.max_compact_items:
+                    trimmed["..."] = f"+{len(value) - index} more keys"
+                    break
+                trimmed[key] = self._prepare_compact_value(item, depth + 1)
+            return trimmed
+        return value
+
+    def _truncate_text(self, value: str) -> str:
+        """Trim text to the configured length while preserving intent."""
+        text = value.strip()
+        if len(text) <= self.max_compact_length:
+            return text
+        return text[: self.max_compact_length].rstrip() + "... [truncated]"
+
+    def _truncate_noisy_sections(self, payload: Any, depth: int = 0) -> None:
+        """Destructively trim noisy fields to keep responses lightweight."""
+        if depth > self.max_compact_depth:
+            return
+        if isinstance(payload, dict):
+            truncated_fields = payload.setdefault("_truncated_fields", [])
+            for key in list(payload.keys()):
+                if key in {"_compact_view", "_compact_text", "_truncated_fields"}:
+                    continue
+                value = payload[key]
+                if key in self._noisy_fields:
+                    if isinstance(value, str) and len(value) > self.max_compact_length:
+                        payload[key] = value[: self.max_compact_length].rstrip() + "... [truncated]"
+                        if key not in truncated_fields:
+                            truncated_fields.append(key)
+                    elif isinstance(value, list) and len(value) > self.max_compact_items:
+                        payload[key] = value[: self.max_compact_items] + [
+                            f"... (+{len(value) - self.max_compact_items} more items)"
+                        ]
+                        if key not in truncated_fields:
+                            truncated_fields.append(key)
+                if isinstance(payload.get(key), dict):
+                    self._truncate_noisy_sections(payload[key], depth + 1)
+                elif isinstance(payload.get(key), list):
+                    for item in payload[key][: self.max_compact_items]:
+                        if isinstance(item, (dict, list)):
+                            self._truncate_noisy_sections(item, depth + 1)
+            if not truncated_fields:
+                payload.pop("_truncated_fields", None)
+        elif isinstance(payload, list):
+            for item in payload[: self.max_compact_items]:
+                if isinstance(item, (dict, list)):
+                    self._truncate_noisy_sections(item, depth + 1)
+
+    def _format_compact_text(self, compact_view: Dict[str, Any]) -> str:
+        """Serialize the compact view into a human-friendly string."""
+        try:
+            return json.dumps(compact_view, ensure_ascii=False, indent=2)
+        except TypeError:
+            return str(compact_view)
+
     def safe_get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Perform a GET request with optional query parameters.
@@ -209,13 +445,13 @@ class HexStrikeClient:
             logger.debug(f"📡 GET {url} with params: {params}")
             response = self.session.get(url, params=params, timeout=self.timeout)
             response.raise_for_status()
-            return response.json()
+            return self._optimize_response(response.json())
         except requests.exceptions.RequestException as e:
             logger.error(f"🚫 Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
+            return self._optimize_response({"error": f"Request failed: {str(e)}", "success": False})
         except Exception as e:
             logger.error(f"💥 Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+            return self._optimize_response({"error": f"Unexpected error: {str(e)}", "success": False})
 
     def safe_post(self, endpoint: str, json_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -234,13 +470,13 @@ class HexStrikeClient:
             logger.debug(f"📡 POST {url} with data: {json_data}")
             response = self.session.post(url, json=json_data, timeout=self.timeout)
             response.raise_for_status()
-            return response.json()
+            return self._optimize_response(response.json())
         except requests.exceptions.RequestException as e:
             logger.error(f"🚫 Request failed: {str(e)}")
-            return {"error": f"Request failed: {str(e)}", "success": False}
+            return self._optimize_response({"error": f"Request failed: {str(e)}", "success": False})
         except Exception as e:
             logger.error(f"💥 Unexpected error: {str(e)}")
-            return {"error": f"Unexpected error: {str(e)}", "success": False}
+            return self._optimize_response({"error": f"Unexpected error: {str(e)}", "success": False})
 
     def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
         """
@@ -5421,6 +5657,23 @@ def parse_args():
     parser.add_argument("--timeout", type=int, default=DEFAULT_REQUEST_TIMEOUT,
                       help=f"Request timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT})")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--compact-output",
+        action="store_true",
+        help="Enable compact output mode to trim noisy tool responses",
+    )
+    parser.add_argument(
+        "--max-compact-length",
+        type=int,
+        default=600,
+        help="Maximum characters retained per text field when compact mode is enabled",
+    )
+    parser.add_argument(
+        "--max-compact-items",
+        type=int,
+        default=5,
+        help="Maximum list/dict entries retained when compact mode is enabled",
+    )
     return parser.parse_args()
 
 def main():
@@ -5438,7 +5691,20 @@ def main():
 
     try:
         # Initialize the HexStrike AI client
-        hexstrike_client = HexStrikeClient(args.server, args.timeout)
+        hexstrike_client = HexStrikeClient(
+            args.server,
+            args.timeout,
+            compact_output=args.compact_output,
+            max_compact_length=args.max_compact_length,
+            max_compact_items=args.max_compact_items,
+        )
+
+        if args.compact_output:
+            logger.info(
+                "🧹 Compact output mode enabled "
+                f"(max text {hexstrike_client.max_compact_length} chars, "
+                f"max items {hexstrike_client.max_compact_items})"
+            )
 
         # Check server health and log the result
         health = hexstrike_client.check_health()
